@@ -42,22 +42,34 @@ createApp({
             perception: {
                 state: 'idle',
                 model: 'yolov8n.pt',
-                tracking_mode: 'yolo',
+                tracking_mode: 'color',
                 target_classes: ['keyboard'],
-                target_color: 'red',
+                target_color: 'orange',
                 detected: false,
                 tracking: false,
                 stable: false,
                 confidence: 0.0,
-                message: 'Ready'
+                message: 'Ready',
+                hsv: { h_min: 5, h_max: 25, s_min: 178, s_max: 255, v_min: 120, v_max: 255 },
+                has_mask: false
             },
             
             // Perception config
             perceptionConfig: {
-                mode: 'yolo',
+                mode: 'color',
                 classes_str: 'keyboard',
-                color: 'red'
+                color: 'orange'
             },
+            
+            // HSV parameters (synced with backend)
+            hsv: {
+                h_min: 5, h_max: 25,
+                s_min: 178, s_max: 255,
+                v_min: 120, v_max: 255
+            },
+            
+            // HSV update debounce timer
+            hsvTimer: null,
             
             // Winch status
             winch: {
@@ -86,14 +98,20 @@ createApp({
     },
     
     mounted() {
-        // Start polling status every 500ms (no SocketIO needed)
         this.startPolling();
         this.loadSavedLocations();
+        this.loadHSV();
         this.addLog('GUI loaded, polling started', 'info');
     },
     
     beforeUnmount() {
         this.stopPolling();
+    },
+    
+    computed: {
+        showMaskFeed() {
+            return this.perceptionConfig.mode === 'color' && this.drone.connected;
+        }
     },
     
     methods: {
@@ -152,6 +170,10 @@ createApp({
                 this.navigation = { ...this.navigation, ...data.navigation };
             }
             if (data.perception) {
+                if (data.perception.hsv) {
+                    this.perception.hsv = data.perception.hsv;
+                    this.perception.has_mask = data.perception.has_mask;
+                }
                 this.perception = { ...this.perception, ...data.perception };
             }
             if (data.winch) {
@@ -434,6 +456,40 @@ createApp({
         async stopPerception() {
             this.addLog('Stopping tracking', 'info');
             await this.apiCall('/api/perception/stop');
+        },
+        
+        // ========== HSV Configuration ==========
+        
+        async loadHSV() {
+            try {
+                const response = await fetch('/api/perception/hsv');
+                if (response.ok) {
+                    const data = await response.json();
+                    this.hsv = { ...this.hsv, ...data };
+                }
+            } catch (e) {
+                // use defaults
+            }
+        },
+        
+        setHSV(key, value) {
+            this.hsv[key] = parseInt(value) || 0;
+            if (this.hsvTimer) clearTimeout(this.hsvTimer);
+            this.hsvTimer = setTimeout(() => {
+                this.pushHSV();
+            }, 80);
+        },
+        
+        async pushHSV() {
+            await this.apiCall('/api/perception/hsv', 'POST', this.hsv);
+        },
+        
+        async resetHSV() {
+            const result = await this.apiCall('/api/perception/hsv/reset', 'POST');
+            if (result.success && result.hsv) {
+                this.hsv = { ...this.hsv, ...result.hsv };
+                this.addLog('HSV parameters reset to defaults', 'info');
+            }
         },
         
         // ========== Module Tests ==========

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Seahawks - Drone Control</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=14">
+    <link rel="stylesheet" href="/static/css/style.css?v=15">
     <!-- Vue.js served locally (no CDN dependency) -->
     <script src="/static/js/vue.global.js"></script>
     <style>
@@ -333,6 +333,70 @@
                                     <option value="orange">Orange</option>
                                 </select>
                             </div>
+                            
+                            <!-- HSV Tuning Controls -->
+                            <div class="hsv-tuning-section">
+                                <div class="hsv-header">
+                                    <label>HSV Parameters</label>
+                                    <button class="btn btn-small btn-secondary" @click="resetHSV" title="Reset to defaults">
+                                        Reset
+                                    </button>
+                                </div>
+                                
+                                <div class="hsv-group">
+                                    <span class="hsv-group-label">H (Hue)</span>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Min</span>
+                                        <input type="range" class="hsv-slider hue-slider" min="0" max="180"
+                                               :value="hsv.h_min" @input="setHSV('h_min', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="180"
+                                               :value="hsv.h_min" @change="setHSV('h_min', $event.target.value)">
+                                    </div>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Max</span>
+                                        <input type="range" class="hsv-slider hue-slider" min="0" max="180"
+                                               :value="hsv.h_max" @input="setHSV('h_max', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="180"
+                                               :value="hsv.h_max" @change="setHSV('h_max', $event.target.value)">
+                                    </div>
+                                </div>
+                                
+                                <div class="hsv-group">
+                                    <span class="hsv-group-label">S (Saturation)</span>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Min</span>
+                                        <input type="range" class="hsv-slider sat-slider" min="0" max="255"
+                                               :value="hsv.s_min" @input="setHSV('s_min', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="255"
+                                               :value="hsv.s_min" @change="setHSV('s_min', $event.target.value)">
+                                    </div>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Max</span>
+                                        <input type="range" class="hsv-slider sat-slider" min="0" max="255"
+                                               :value="hsv.s_max" @input="setHSV('s_max', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="255"
+                                               :value="hsv.s_max" @change="setHSV('s_max', $event.target.value)">
+                                    </div>
+                                </div>
+                                
+                                <div class="hsv-group">
+                                    <span class="hsv-group-label">V (Value)</span>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Min</span>
+                                        <input type="range" class="hsv-slider val-slider" min="0" max="255"
+                                               :value="hsv.v_min" @input="setHSV('v_min', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="255"
+                                               :value="hsv.v_min" @change="setHSV('v_min', $event.target.value)">
+                                    </div>
+                                    <div class="hsv-row">
+                                        <span class="hsv-label">Max</span>
+                                        <input type="range" class="hsv-slider val-slider" min="0" max="255"
+                                               :value="hsv.v_max" @input="setHSV('v_max', $event.target.value)">
+                                        <input type="number" class="hsv-number" min="0" max="255"
+                                               :value="hsv.v_max" @change="setHSV('v_max', $event.target.value)">
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                         
                         <div class="button-grid-3">
@@ -404,24 +468,44 @@
 
             <!-- Right Panel: Video & Logs -->
             <div class="display-panel">
-                <!-- Video Stream (MJPEG from drone camera) -->
-                <section class="card video-card">
-                    <div class="card-header">
-                        <h2>📹 Live Video</h2>
-                        <span class="video-status" v-if="drone.connected">● LIVE</span>
-                    </div>
-                    <div class="video-container">
-                        <!-- Use :src binding so browser only loads when Vue sets the value -->
-                        <img v-if="drone.connected" 
-                             :src="'/api/video_feed'" 
-                             alt="Drone Camera" 
-                             class="video-stream">
-                        <div v-else class="video-placeholder">
-                            <span class="placeholder-icon">📹</span>
-                            <p>Connect drone to view camera feed</p>
+                <!-- Video Streams Row -->
+                <div class="video-row" :class="{'video-row-dual': showMaskFeed}">
+                    <!-- Main Video Stream -->
+                    <section class="card video-card">
+                        <div class="card-header">
+                            <h2>📹 Live Video</h2>
+                            <span class="video-status" v-if="drone.connected">● LIVE</span>
                         </div>
-                    </div>
-                </section>
+                        <div class="video-container">
+                            <img v-if="drone.connected" 
+                                 :src="'/api/video_feed'" 
+                                 alt="Drone Camera" 
+                                 class="video-stream">
+                            <div v-else class="video-placeholder">
+                                <span class="placeholder-icon">📹</span>
+                                <p>Connect drone to view camera feed</p>
+                            </div>
+                        </div>
+                    </section>
+                    
+                    <!-- Mask Video Stream (color detection only) -->
+                    <section class="card video-card mask-card" v-if="showMaskFeed">
+                        <div class="card-header">
+                            <h2>🎭 Color Mask</h2>
+                            <span class="video-status mask-status" v-if="perception.has_mask">● MASK</span>
+                        </div>
+                        <div class="video-container">
+                            <img v-if="drone.connected" 
+                                 :src="'/api/mask_feed'" 
+                                 alt="Color Mask" 
+                                 class="video-stream">
+                            <div v-else class="video-placeholder">
+                                <span class="placeholder-icon">🎭</span>
+                                <p>Start color detection to view mask</p>
+                            </div>
+                        </div>
+                    </section>
+                </div>
 
                 <!-- System Logs -->
                 <section class="card logs-card">
@@ -443,6 +527,6 @@
     </div>
     {% endraw %}
 
-    <script src="/static/js/app.js?v=14"></script>
+    <script src="/static/js/app.js?v=15"></script>
 </body>
 </html>

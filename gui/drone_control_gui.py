@@ -124,9 +124,9 @@ class PerceptionStatus:
     """感知系统状态"""
     state: str = SystemState.IDLE.value
     model: str = "/home/seahaws/Drone/perception/yolov8s.pt"
-    tracking_mode: str = "yolo"  # yolo 或 color
+    tracking_mode: str = "color"  # color 为默认检测方式
     target_classes: list = None
-    target_color: str = "red"
+    target_color: str = "orange"
     detected: bool = False
     tracking: bool = False
     stable: bool = False
@@ -136,6 +136,20 @@ class PerceptionStatus:
     def __post_init__(self):
         if self.target_classes is None:
             self.target_classes = ["keyboard"]
+
+
+# 颜色检测 HSV 参数（经过 test_color_tracking.py 实测验证）
+DEFAULT_HSV_CONFIG = {
+    "h_min": 5,   "h_max": 25,
+    "s_min": 178, "s_max": 255,
+    "v_min": 120, "v_max": 255,
+}
+
+# 颜色检测增强参数
+COLOR_EMA_ALPHA = 0.4
+COLOR_MIN_AREA_RATIO = 0.001
+COLOR_MORPH_KERNEL_SIZE = 7
+COLOR_GAUSSIAN_BLUR_SIZE = 5
 
 
 @dataclass
@@ -175,8 +189,16 @@ class DroneControlSystem:
         self.flush_lock = threading.Lock()
         self.current_frame = None      # 原始摄像头帧 (由 frame_updater 更新)
         self.display_frame = None      # 带叠加层的显示帧 (由 perception 更新)
+        self.mask_frame = None         # 颜色检测 mask 帧 (由 perception 更新)
         self.frame_lock = threading.Lock()
         self.streaming = False
+        
+        # HSV 颜色检测参数（可通过 API 实时调整）
+        self.hsv_config = DEFAULT_HSV_CONFIG.copy()
+        
+        # EMA 平滑中心点（颜色检测专用）
+        self._color_smooth_cx = None
+        self._color_smooth_cy = None
         
         # 外部系统 (Winch & Gripper)
         self.external_system = ExternalSystemController()
@@ -1029,13 +1051,12 @@ class DroneControlSystem:
             
             self.log("👁️ Perception running - tracking target", "info")
             
-            # ---- 跟踪参数（基于 fly_track_and_grab.py SafeTracker，针对抖动优化） ----
-            # 摄像头朝下，用 roll/pitch 控制水平移动跟踪目标
-            STABILITY_THRESHOLD = 0.25  # 偏移量 < 此值算 "centered"（放宽，容忍抖动）
-            DEADZONE = 0.15             # 死区（略小于阈值，让无人机在阈值内仍微调）
-            KP = 5.0                    # 比例增益
-            MAX_SPEED = 5               # 极保守最大控制量
-            SMOOTHING = 0.05            # 极平滑
+            # ---- 跟踪参数（经 test_color_tracking.py 实测验证，防过冲调优） ----
+            STABILITY_THRESHOLD = 0.25  # 偏移量 < 此值算 "centered"
+            DEADZONE = 0.20             # 死区（放大→减少来回震荡）
+            KP = 3.0                    # 比例增益（降低→减少过冲）
+            MAX_SPEED = 3               # 最大控制量（降低→限制最大飞行速度）
+            SMOOTHING = 0.10            # 控制量平滑系数（提高→更快响应，减少惯性过冲）
             MAX_LOST_FRAMES = 20        # 目标丢失多少帧后平滑停止
             
             stable_count = 0
@@ -1091,44 +1112,72 @@ class DroneControlSystem:
                 
                 elif mode == "color":
                     try:
-                        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                        color = self.perception_status.target_color
+                        h, w = frame.shape[:2]
+                        frame_area = h * w
                         
-                        color_ranges = {
-                            "red":    ([0, 100, 100], [10, 255, 255], [160, 100, 100], [180, 255, 255]),
-                            "green":  ([35, 100, 100], [85, 255, 255], None, None),
-                            "blue":   ([100, 100, 100], [130, 255, 255], None, None),
-                            "yellow": ([20, 100, 100], [35, 255, 255], None, None),
-                            "orange": ([10, 100, 100], [20, 255, 255], None, None),
-                        }
+                        # 1. 高斯模糊降噪
+                        blurred = cv2.GaussianBlur(frame, (COLOR_GAUSSIAN_BLUR_SIZE, COLOR_GAUSSIAN_BLUR_SIZE), 0)
                         
-                        ranges = color_ranges.get(color, color_ranges["red"])
-                        mask = cv2.inRange(hsv, np.array(ranges[0]), np.array(ranges[1]))
-                        if ranges[2] is not None:
-                            mask2 = cv2.inRange(hsv, np.array(ranges[2]), np.array(ranges[3]))
-                            mask = cv2.bitwise_or(mask, mask2)
+                        # 2. BGR → HSV
+                        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
                         
+                        # 3. 使用实时可调 HSV 参数构建 mask
+                        hsv_cfg = self.hsv_config
+                        lower = np.array([hsv_cfg["h_min"], hsv_cfg["s_min"], hsv_cfg["v_min"]])
+                        upper = np.array([hsv_cfg["h_max"], hsv_cfg["s_max"], hsv_cfg["v_max"]])
+                        mask = cv2.inRange(hsv, lower, upper)
+                        
+                        # 4. 形态学操作：OPEN 去小噪点 → CLOSE 填小洞
+                        kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE,
+                            (COLOR_MORPH_KERNEL_SIZE, COLOR_MORPH_KERNEL_SIZE)
+                        )
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        
+                        # 5. 保存 mask 帧供前端显示
+                        mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                        with self.frame_lock:
+                            self.mask_frame = mask_colored
+                        
+                        # 6. 查找轮廓
                         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         if contours:
                             largest = max(contours, key=cv2.contourArea)
                             area = cv2.contourArea(largest)
-                            if area > 500:
+                            min_area = frame_area * COLOR_MIN_AREA_RATIO
+                            
+                            if area > min_area:
                                 detected = True
-                                confidence = min(1.0, area / 10000)
-                                det_label = f"{color}"
+                                confidence = min(1.0, area / (frame_area * 0.05))
+                                det_label = f"{self.perception_status.target_color}"
                                 
                                 rx, ry, rw, rh = cv2.boundingRect(largest)
                                 det_bbox = (rx, ry, rx + rw, ry + rh)
                                 
                                 M = cv2.moments(largest)
                                 if M["m00"] > 0:
-                                    tcx = int(M["m10"] / M["m00"])
-                                    tcy = int(M["m01"] / M["m00"])
+                                    raw_cx = int(M["m10"] / M["m00"])
+                                    raw_cy = int(M["m01"] / M["m00"])
+                                    
+                                    # 7. EMA 平滑中心点（减少抖动）
+                                    if self._color_smooth_cx is None:
+                                        self._color_smooth_cx = float(raw_cx)
+                                        self._color_smooth_cy = float(raw_cy)
+                                    else:
+                                        self._color_smooth_cx = COLOR_EMA_ALPHA * raw_cx + (1 - COLOR_EMA_ALPHA) * self._color_smooth_cx
+                                        self._color_smooth_cy = COLOR_EMA_ALPHA * raw_cy + (1 - COLOR_EMA_ALPHA) * self._color_smooth_cy
+                                    
+                                    tcx = int(self._color_smooth_cx)
+                                    tcy = int(self._color_smooth_cy)
                                     det_center = (tcx, tcy)
                                     
-                                    h, w = frame.shape[:2]
                                     offset_x = (tcx - w / 2) / (w / 2)
                                     offset_y = (tcy - h / 2) / (h / 2)
+                        else:
+                            # 没有轮廓时也更新 mask 帧
+                            with self.frame_lock:
+                                self.mask_frame = mask_colored
                     except Exception:
                         pass
                 
@@ -1247,9 +1296,12 @@ class DroneControlSystem:
                 
                 time.sleep(0.005)
             
-            # 清除显示帧叠加层，恢复原始画面
+            # 清除显示帧叠加层、mask 帧，恢复原始画面
             with self.frame_lock:
                 self.display_frame = None
+                self.mask_frame = None
+            self._color_smooth_cx = None
+            self._color_smooth_cy = None
             
             # 退出循环后立即发送归零命令，确保无人机停止追踪运动
             self._send_hover()
@@ -1333,10 +1385,13 @@ class DroneControlSystem:
     
     def get_status(self) -> Dict[str, Any]:
         """获取系统完整状态"""
+        p = asdict(self.perception_status)
+        p["hsv"] = self.hsv_config.copy()
+        p["has_mask"] = self.mask_frame is not None
         return {
             "drone": asdict(self.drone_status),
             "navigation": asdict(self.navigation_status),
-            "perception": asdict(self.perception_status),
+            "perception": p,
             "winch": asdict(self.winch_status),
             "logs": self.logs[-10:]  # 最近10条日志
         }
@@ -1415,10 +1470,33 @@ def api_navigation_start():
 def api_perception_config():
     """配置感知系统"""
     data = request.json
-    control_system.perception_status.tracking_mode = data.get('mode', 'yolo')
+    control_system.perception_status.tracking_mode = data.get('mode', 'color')
     control_system.perception_status.target_classes = data.get('classes', ['person'])
-    control_system.perception_status.target_color = data.get('color', 'red')
+    control_system.perception_status.target_color = data.get('color', 'orange')
     return jsonify({"success": True})
+
+
+@app.route('/api/perception/hsv', methods=['GET'])
+def api_perception_hsv_get():
+    """获取当前 HSV 参数"""
+    return jsonify(control_system.hsv_config)
+
+
+@app.route('/api/perception/hsv', methods=['POST'])
+def api_perception_hsv_set():
+    """实时更新 HSV 参数"""
+    data = request.json
+    for key in ("h_min", "h_max", "s_min", "s_max", "v_min", "v_max"):
+        if key in data:
+            control_system.hsv_config[key] = int(data[key])
+    return jsonify({"success": True, "hsv": control_system.hsv_config})
+
+
+@app.route('/api/perception/hsv/reset', methods=['POST'])
+def api_perception_hsv_reset():
+    """重置 HSV 参数为默认值"""
+    control_system.hsv_config = DEFAULT_HSV_CONFIG.copy()
+    return jsonify({"success": True, "hsv": control_system.hsv_config})
 
 
 @app.route('/api/perception/start', methods=['POST'])
@@ -1602,6 +1680,35 @@ def api_video_feed():
                            jpeg.tobytes() + b'\r\n')
             
             time.sleep(0.02)  # ~50fps MJPEG 推流（浏览器 MJPEG 渲染瓶颈约 30-60fps）
+    
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/api/mask_feed')
+def api_mask_feed():
+    """颜色检测 mask 视频流 (MJPEG over HTTP)"""
+    def generate():
+        while True:
+            with control_system.frame_lock:
+                frame = control_system.mask_frame
+            
+            if frame is not None:
+                ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' +
+                           jpeg.tobytes() + b'\r\n')
+            else:
+                blank = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "No Mask Feed", (190, 180),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+                ret, jpeg = cv2.imencode('.jpg', blank)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' +
+                           jpeg.tobytes() + b'\r\n')
+            
+            time.sleep(0.02)
     
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
