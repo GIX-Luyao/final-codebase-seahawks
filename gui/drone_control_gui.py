@@ -46,6 +46,161 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
+class LoRaGPSReceiver:
+    """LoRa GPS 接收器 - 解析另一组通过 LoRa 发送的目标坐标
+
+    对端发送格式 (Heltec WiFi LoRa 32 V3 / SX1262):
+        "<lat>,<lng>"
+    示例:
+        47.6217966,-122.178422
+
+    LoRa 参数（接收端 ESP32 固件必须与发送端完全一致）:
+        Frequency : 915.0 MHz
+        Bandwidth : 125.0 kHz
+        SF        : 7
+        CodingRate: 4/5
+        Preamble  : 8
+        SyncWord  : 0x34
+        CRC       : true
+
+    本类只负责读串口 + 解析坐标，与无人机连接状态完全独立。
+    """
+
+    def __init__(self):
+        self._serial = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self._running = False
+
+        # 连接配置
+        self.port = "/dev/ttyUSB0"
+        self.baud = 115200
+
+        # 坐标状态（fix=True 表示已收到有效坐标）
+        self.connected = False
+        self.fix = False
+        self.latitude = 0.0
+        self.longitude = 0.0
+        self.packet_count = 0
+        self.last_received = 0.0   # time.time()
+        self.rssi = 0.0            # dBm，来自接收端 RSSI 行
+        self.snr = 0.0             # dB，来自接收端 SNR 行
+        self.error_message = ""
+
+    def connect(self, port: str = None, baud: int = None) -> bool:
+        if port:
+            self.port = port
+        if baud:
+            self.baud = int(baud)
+
+        # 若已连接，先断开再重连
+        if self._serial and self._serial.is_open:
+            self.disconnect()
+
+        try:
+            import serial as pyserial
+            self._serial = pyserial.Serial(self.port, self.baud, timeout=1)
+            self.connected = True
+            self.error_message = ""
+            self._running = True
+            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._thread.start()
+            return True
+        except ImportError:
+            self.error_message = "pyserial not installed. Run: pip install pyserial"
+            self.connected = False
+            return False
+        except Exception as e:
+            self.error_message = str(e)
+            self.connected = False
+            return False
+
+    def disconnect(self):
+        self._running = False
+        self.connected = False
+        if self._serial:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+
+    def get_status(self) -> dict:
+        with self._lock:
+            age = round(time.time() - self.last_received, 1) if self.last_received > 0 else -1
+            return {
+                "connected": self.connected,
+                "port": self.port,
+                "baud": self.baud,
+                "fix": self.fix,
+                "latitude": self.latitude,
+                "longitude": self.longitude,
+                "packet_count": self.packet_count,
+                "last_received_age": age,
+                "rssi": self.rssi,
+                "snr": self.snr,
+                "error": self.error_message,
+            }
+
+    def _reader_loop(self):
+        """串口读取线程 - 持续读取所有行并尝试解析坐标"""
+        while self._running:
+            try:
+                if not self._serial or not self._serial.is_open:
+                    break
+                line = self._serial.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    self._parse(line)
+            except Exception:
+                if self._running:
+                    time.sleep(0.1)
+        self.connected = False
+
+    def _parse(self, line: str):
+        """解析接收端 (Heltec RX) 的串口输出行。
+
+        接收端每收到一个包会依次打印以下几行：
+            ---------------------------------
+            ✅ RX: 47.6217966,-122.178422      ← 坐标行（必须解析）
+            Parsed LAT = 47.6217966
+            Parsed LON = -122.178422
+            RSSI = -45.5 dBm, SNR = 9.5 dB   ← 信号质量行（可选解析）
+
+        策略：
+          - 含 'RX: ' 的行 → 提取 lat,lng
+          - 含 'RSSI' 的行 → 提取 rssi / snr
+          - 其它行（分隔线、Parsed LAT/LON、超时、错误）→ 静默忽略
+        """
+        # ---- 坐标行: "✅ RX: 47.6217966,-122.178422" ----
+        if 'RX: ' in line:
+            try:
+                payload = line.split('RX: ', 1)[1].strip()
+                parts = payload.split(',')
+                if len(parts) == 2:
+                    lat = float(parts[0].strip())
+                    lng = float(parts[1].strip())
+                    if -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0:
+                        with self._lock:
+                            self.fix           = True
+                            self.latitude      = lat
+                            self.longitude     = lng
+                            self.packet_count += 1
+                            self.last_received = time.time()
+            except (ValueError, IndexError):
+                pass
+
+        # ---- 信号质量行: "RSSI = -45.5 dBm, SNR = 9.5 dB" ----
+        elif 'RSSI' in line and 'SNR' in line:
+            try:
+                rssi = float(line.split('RSSI =')[1].split('dBm')[0].strip())
+                snr  = float(line.split('SNR =')[1].split('dB')[0].strip())
+                with self._lock:
+                    self.rssi = rssi
+                    self.snr  = snr
+            except (ValueError, IndexError):
+                pass
+
+
 class ExternalSystemController:
     """外部系统控制器 (通过HTTP请求) - 来自 fly_track_and_grab.py"""
     
@@ -202,6 +357,9 @@ class DroneControlSystem:
         
         # 外部系统 (Winch & Gripper)
         self.external_system = ExternalSystemController()
+        
+        # LoRa GPS 接收器（接收另一组发来的目标坐标）
+        self.lora_receiver = LoRaGPSReceiver()
         
         # 日志
         self.logs = []
@@ -1174,10 +1332,22 @@ class DroneControlSystem:
                                     
                                     offset_x = (tcx - w / 2) / (w / 2)
                                     offset_y = (tcy - h / 2) / (h / 2)
+                                    
+                                    # 8. 绘制轮廓线 + 中心圆点到 mask 帧（与 test_color_tracking.py 一致）
+                                    cv2.drawContours(mask_colored, contours, -1, (0, 255, 0), 2)
+                                    cv2.circle(mask_colored, (tcx, tcy), 8, (0, 0, 255), -1)
+                            else:
+                                # 面积不足：重置 EMA，避免目标重现时从旧位置漂移
+                                self._color_smooth_cx = None
+                                self._color_smooth_cy = None
                         else:
-                            # 没有轮廓时也更新 mask 帧
-                            with self.frame_lock:
-                                self.mask_frame = mask_colored
+                            # 无轮廓：重置 EMA，避免目标重现时从旧位置漂移
+                            self._color_smooth_cx = None
+                            self._color_smooth_cy = None
+                        
+                        # 更新 mask 帧（含轮廓/中心点叠加，若已绘制）
+                        with self.frame_lock:
+                            self.mask_frame = mask_colored
                     except Exception:
                         pass
                 
@@ -1393,6 +1563,7 @@ class DroneControlSystem:
             "navigation": asdict(self.navigation_status),
             "perception": p,
             "winch": asdict(self.winch_status),
+            "lora_gps": self.lora_receiver.get_status(),
             "logs": self.logs[-10:]  # 最近10条日志
         }
 
@@ -1759,6 +1930,34 @@ def api_test_winch():
     # 在后台线程运行（因为有 sleep）
     threading.Thread(target=run_test, daemon=True).start()
     return jsonify({"success": True})
+
+
+@app.route('/api/lora/connect', methods=['POST'])
+def api_lora_connect():
+    """连接 LoRa GPS 串口接收器"""
+    data = request.json or {}
+    port = data.get('port', '/dev/ttyUSB0')
+    baud = int(data.get('baud', 115200))
+    success = control_system.lora_receiver.connect(port, baud)
+    if success:
+        control_system.log(f"📡 LoRa GPS receiver connected on {port} @ {baud}", "success")
+    else:
+        control_system.log(f"❌ LoRa GPS connect failed: {control_system.lora_receiver.error_message}", "error")
+    return jsonify({"success": success, "status": control_system.lora_receiver.get_status()})
+
+
+@app.route('/api/lora/disconnect', methods=['POST'])
+def api_lora_disconnect():
+    """断开 LoRa GPS 串口"""
+    control_system.lora_receiver.disconnect()
+    control_system.log("📡 LoRa GPS receiver disconnected", "info")
+    return jsonify({"success": True})
+
+
+@app.route('/api/lora/status', methods=['GET'])
+def api_lora_status():
+    """获取 LoRa GPS 当前状态"""
+    return jsonify(control_system.lora_receiver.get_status())
 
 
 def main():

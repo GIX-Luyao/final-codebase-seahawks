@@ -93,7 +93,25 @@ createApp({
             // Saved GPS locations
             savedLocations: [],
             newLocationName: '',
-            selectedLocationIdx: -1
+            selectedLocationIdx: -1,
+
+            // LoRa GPS Receiver (独立于无人机连接，可单独使用)
+            loraGps: {
+                connected: false,
+                port: '/dev/ttyUSB0',
+                baud: 115200,
+                fix: false,
+                latitude: 0.0,
+                longitude: 0.0,
+                packet_count: 0,
+                last_received_age: -1,  // 距上次收包秒数，-1=从未收到；>6s=stale（发送间隔2s）
+                rssi: 0.0,              // dBm，越接近0信号越好（通常 -120~0）
+                snr: 0.0,              // dB，>0 为正常，<0 信号差
+                error: ''
+            },
+            loraPort: '/dev/ttyUSB0',
+            loraBaud: 115200,
+            loraBusy: false
         };
     },
     
@@ -111,6 +129,14 @@ createApp({
     computed: {
         showMaskFeed() {
             return this.perceptionConfig.mode === 'color' && this.drone.connected;
+        },
+
+        // RSSI 信号强度颜色: 好(绿) / 中(黄) / 差(红)
+        loraRssiClass() {
+            const r = this.loraGps.rssi;
+            if (r >= -70) return 'rssi-good';
+            if (r >= -100) return 'rssi-fair';
+            return 'rssi-poor';
         }
     },
     
@@ -178,6 +204,9 @@ createApp({
             }
             if (data.winch) {
                 this.winch = { ...this.winch, ...data.winch };
+            }
+            if (data.lora_gps) {
+                this.loraGps = { ...this.loraGps, ...data.lora_gps };
             }
             if (data.logs && data.logs.length > 0) {
                 // Only add new logs
@@ -607,6 +636,48 @@ createApp({
             } catch (error) {
                 console.error('Manual control error:', error);
             }
+        },
+
+        // ========== LoRa GPS Receiver ==========
+
+        async connectLora() {
+            if (this.loraBusy) return;
+            this.loraBusy = true;
+            try {
+                const result = await this.apiCall('/api/lora/connect', 'POST', {
+                    port: this.loraPort,
+                    baud: this.loraBaud
+                });
+                if (result.success) {
+                    this.addLog(`LoRa GPS receiver connected on ${this.loraPort}`, 'success');
+                } else {
+                    const err = result.status?.error || 'unknown error';
+                    this.addLog(`LoRa GPS connect failed: ${err}`, 'error');
+                }
+                if (result.status) {
+                    this.loraGps = { ...this.loraGps, ...result.status };
+                }
+            } finally {
+                this.loraBusy = false;
+            }
+        },
+
+        async disconnectLora() {
+            await this.apiCall('/api/lora/disconnect', 'POST');
+            this.addLog('LoRa GPS receiver disconnected', 'info');
+        },
+
+        useLoraAsTarget() {
+            if (!this.loraGps.fix) {
+                this.addLog('No GPS fix yet — cannot use as navigation target', 'warning');
+                return;
+            }
+            this.navConfig.target_lat = this.loraGps.latitude;
+            this.navConfig.target_lon = this.loraGps.longitude;
+            this.addLog(
+                `LoRa GPS → target set: (${this.loraGps.latitude.toFixed(6)}, ${this.loraGps.longitude.toFixed(6)})`,
+                'success'
+            );
         }
     }
 }).mount('#app');

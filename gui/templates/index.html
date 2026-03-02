@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Seahawks - Drone Control</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=15">
+    <link rel="stylesheet" href="/static/css/style.css?v=16">
     <!-- Vue.js served locally (no CDN dependency) -->
     <script src="/static/js/vue.global.js"></script>
     <style>
@@ -201,7 +201,90 @@
                         <span class="status-badge" :class="getStatusClass(navigation.state)">
                             {{ getStatusText(navigation.state) }}
                         </span>
-                        
+
+                        <!-- LoRa GPS Receiver Panel -->
+                        <div class="lora-panel">
+                            <div class="lora-panel-header">
+                                <div class="lora-title">
+                                    <span class="lora-icon">📡</span>
+                                    <span>LoRa GPS Receiver</span>
+                                    <span class="lora-independent-badge">Independent</span>
+                                </div>
+                                <div class="lora-conn-badge" :class="loraGps.connected ? 'lora-online' : 'lora-offline'">
+                                    <span class="lora-dot"></span>
+                                    <span>{{ loraGps.connected ? 'Connected' : 'Offline' }}</span>
+                                </div>
+                            </div>
+
+                            <!-- Disconnected: show port config -->
+                            <div class="lora-config" v-if="!loraGps.connected">
+                                <div class="lora-input-row">
+                                    <input type="text" v-model="loraPort"
+                                           class="lora-port-input" placeholder="/dev/ttyUSB0">
+                                    <input type="number" v-model.number="loraBaud"
+                                           class="lora-baud-input" placeholder="115200">
+                                    <button class="btn btn-sm btn-primary"
+                                            @click="connectLora" :disabled="loraBusy">
+                                        <span v-if="loraBusy">...</span>
+                                        <span v-else>Connect</span>
+                                    </button>
+                                </div>
+                                <small class="lora-hint">
+                                    Serial port of LoRa receiver module (baud: 115200) · Works without drone connection
+                                </small>
+                                <p class="lora-error" v-if="loraGps.error">⚠️ {{ loraGps.error }}</p>
+                            </div>
+
+                            <!-- Connected: show live data -->
+                            <div class="lora-data" v-if="loraGps.connected">
+                                <div class="lora-status-row">
+                                    <span class="lora-fix-badge" :class="loraGps.fix ? 'fix-ok' : 'fix-none'">
+                                        {{ loraGps.fix ? '✅ Coords Received' : '⏳ Waiting...' }}
+                                    </span>
+                                    <span class="lora-pkts">📦 {{ loraGps.packet_count }} pkts</span>
+                                    <span class="lora-age"
+                                          :class="loraGps.last_received_age < 0 ? 'age-none' : loraGps.last_received_age > 6 ? 'age-stale' : 'age-fresh'">
+                                        <span v-if="loraGps.last_received_age < 0">No packets yet</span>
+                                        <span v-else>{{ loraGps.last_received_age }}s ago</span>
+                                    </span>
+                                </div>
+
+                                <div class="lora-coords" v-if="loraGps.fix">
+                                    <div class="lora-coord-item">
+                                        <span class="lora-coord-label">Lat</span>
+                                        <span class="lora-coord-value">{{ loraGps.latitude.toFixed(7) }}</span>
+                                    </div>
+                                    <div class="lora-coord-item">
+                                        <span class="lora-coord-label">Lng</span>
+                                        <span class="lora-coord-value">{{ loraGps.longitude.toFixed(7) }}</span>
+                                    </div>
+                                </div>
+
+                                <!-- RSSI / SNR 信号质量 -->
+                                <div class="lora-signal" v-if="loraGps.rssi !== 0">
+                                    <span class="lora-signal-item" :class="loraRssiClass">
+                                        📶 {{ loraGps.rssi.toFixed(1) }} dBm
+                                    </span>
+                                    <span class="lora-signal-item lora-snr">
+                                        SNR {{ loraGps.snr.toFixed(1) }} dB
+                                    </span>
+                                </div>
+                                <div class="lora-no-fix" v-else>
+                                    Waiting for target coordinates from remote sender...
+                                </div>
+
+                                <div class="lora-actions">
+                                    <button class="btn btn-sm btn-success" @click="useLoraAsTarget"
+                                            :disabled="!loraGps.fix || navigation.state === 'running'">
+                                        📌 Use as Navigation Target
+                                    </button>
+                                    <button class="btn btn-sm btn-secondary" @click="disconnectLora">
+                                        Disconnect
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Saved Locations -->
                         <div class="saved-locations-section">
                             <label>Saved Locations</label>
@@ -527,6 +610,6 @@
     </div>
     {% endraw %}
 
-    <script src="/static/js/app.js?v=15"></script>
+    <script src="/static/js/app.js?v=16"></script>
 </body>
 </html>
