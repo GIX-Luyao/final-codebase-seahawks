@@ -1,3 +1,6 @@
+# ============================================
+# General
+# ============================================
 .DS_Store
 *.log
 __pycache__/
@@ -7,3 +10,33 @@ venv/
 node_modules/
 dist/
 build/
+.cursor/
+
+# ============================================
+# Model weights (large binary files)
+# ============================================
+*.pt
+
+# ============================================
+# Redundant / development-only scripts
+# ============================================
+drone_detection_simple.py
+object_detector.py
+external_systems.py
+fly_to_gps.py
+fly_track_and_grab.py
+fly_track_and_grab_ws.py
+fly_track_target.py
+fly_watch_detection.py
+test_external_flow.py
+
+# ============================================
+# ESP32 firmware (hardware-specific, not run directly)
+# ============================================
+esp/
+
+# ============================================
+# Duplicate / loose assets at gui/ root
+# ============================================
+gui/background.webp
+gui/logo.png
