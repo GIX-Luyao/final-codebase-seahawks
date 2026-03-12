@@ -201,41 +201,124 @@ class LoRaGPSReceiver:
                 pass
 
 
-class ExternalSystemController:
-    """外部系统控制器 (通过HTTP请求) - 来自 fly_track_and_grab.py"""
-    
-    def __init__(self, base_url: str = "http://192.168.42.37", timeout: float = 5.0):
-        self.base_url = base_url
-        self.timeout = timeout
-        
-    def send_command(self, command: str) -> bool:
-        """发送命令到外部系统: 'lower', 'pull', 'stop'"""
-        url = f"{self.base_url}/{command}"
+# ── Winch Serial Controller (USB direct connection) ────────────────────────
+class WinchSerialController:
+    """
+    Winch controller via USB Serial.
+    Protocol: send 'lower:<mm>\\n' / 'pull:<mm>\\n' / 'stop\\n'
+    Response:  'ok\\n' (command accepted) then 'ok: done\\n' (motion complete)
+    """
+
+    def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 115200):
+        self.port = port
+        self.baud = baud
+        self._ser = None
+        self.connected = False
+
+    def connect(self) -> bool:
         try:
-            response = requests.get(url, timeout=self.timeout)
-            if response.status_code == 200:
-                return True
-            else:
-                return False
-        except requests.exceptions.Timeout:
+            import serial as _serial
+            self._ser = _serial.Serial(self.port, self.baud, timeout=1.0)
+            self.connected = True
+            print(f"[WINCH SERIAL] Connected: {self.port} @ {self.baud}")
+            return True
+        except Exception as e:
+            print(f"[WINCH SERIAL] Connect failed: {e}")
+            self.connected = False
             return False
-        except requests.exceptions.ConnectionError:
-            return False
-        except Exception:
-            return False
-    
-    def execute_grab_sequence(self, wait_time: float = 5.0, pull_time: float = 3.0) -> bool:
-        """执行抓取序列: LOWER → wait → PULL → wait → STOP"""
-        if not self.send_command("lower"):
-            return False
-        time.sleep(wait_time)
-        
-        if not self.send_command("pull"):
-            return False
-        time.sleep(pull_time)
-        
-        self.send_command("stop")
-        return True
+
+    def disconnect(self):
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+        self.connected = False
+
+    def send_raw(self, cmd_str: str, expect_response: bool = True, timeout: float = 10.0) -> Optional[str]:
+        """Send a command and optionally wait for ok/err response.
+
+        Reads lines until 'ok' or 'err' is found, or until timeout.
+        All received lines are printed; caller sees the matching line or None on timeout.
+        """
+        if not self.connected or not self._ser:
+            if not self.connect():
+                return None
+        try:
+            cmd_bytes = (cmd_str.strip() + "\r\n").encode("utf-8")
+            self._ser.write(cmd_bytes)
+            print(f"[WINCH SERIAL] → {cmd_str}")
+            if not expect_response:
+                return ""
+            deadline = time.time() + timeout
+            last_line = None
+            while time.time() < deadline:
+                self._ser.timeout = max(0.05, deadline - time.time())
+                raw = self._ser.readline()
+                if not raw:
+                    continue
+                resp = raw.decode("utf-8", errors="ignore").strip()
+                if not resp:
+                    continue
+                print(f"[WINCH SERIAL] ← {resp}")
+                last_line = resp
+                if "ok" in resp.lower() or "err" in resp.lower():
+                    return resp
+            print(f"[WINCH SERIAL] timeout ({timeout:.0f}s) waiting for ok/err — last: {last_line!r}")
+            return None
+        except Exception as e:
+            print(f"[WINCH SERIAL] send error: {e}")
+            self.connected = False
+            return None
+
+    def recv_with_timeout(self, timeout_sec: float) -> Optional[str]:
+        """Read one line from serial with a timeout (used for ok: done polling)."""
+        if not self.connected or not self._ser:
+            return None
+        try:
+            old_timeout = self._ser.timeout
+            self._ser.timeout = timeout_sec
+            try:
+                raw = self._ser.readline()
+            finally:
+                self._ser.timeout = old_timeout
+            if not raw:
+                return None
+            resp = raw.decode("utf-8", errors="ignore").strip()
+            return resp if resp else None
+        except Exception as e:
+            print(f"[WINCH SERIAL] recv error: {e}")
+            return None
+
+    def stop(self):
+        """Send stop command (no response expected)."""
+        self.send_raw("stop", expect_response=False)
+
+
+# ── GripperController (WebSocket, from external_systems) ────────────────────
+try:
+    _ext_dir = str(Path(__file__).resolve().parent.parent)
+    if _ext_dir not in sys.path:
+        sys.path.insert(0, _ext_dir)
+    from external_systems import GripperController
+    _GRIPPER_OK = True
+except ImportError as _e:
+    _GRIPPER_OK = False
+    print(f"[WARN] external_systems not available: {_e}")
+    print("[WARN] Gripper WebSocket features disabled")
+
+# 默认配置（可通过 /api/winch/config 动态修改）
+DEFAULT_WINCH_CONFIG = {
+    "winch_port":   "/dev/ttyUSB1",   # Serial port for Winch
+    "winch_baud":   115200,            # Serial baud rate
+    "gripper_url":  "ws://192.168.42.15:81",
+    "lower_length": 300.0,             # mm
+    "pull_length":  400.0,             # mm
+    "lower_wait":   120.0,             # seconds to wait for ok: done after lower
+    "pull_wait":    120.0,             # seconds to wait for ok: done after pull
+    "use_gripper":  True,
+}
 
 
 class SystemState(Enum):
@@ -271,7 +354,7 @@ class NavigationStatus:
     target_alt: float = 2.0
     current_distance: float = 0.0
     progress: int = 0
-    message: str = "就绪"
+    message: str = "Ready"
 
 
 @dataclass
@@ -309,11 +392,13 @@ COLOR_GAUSSIAN_BLUR_SIZE = 5
 
 @dataclass
 class WinchStatus:
-    """绞盘系统状态"""
+    """Winch & Gripper system status"""
     state: str = SystemState.IDLE.value
     current_action: str = "IDLE"
-    message: str = "就绪"
+    message: str = "Ready"
     progress: int = 0
+    winch_ws_connected: bool = False
+    gripper_ws_connected: bool = False
 
 
 class DroneControlSystem:
@@ -355,8 +440,11 @@ class DroneControlSystem:
         self._color_smooth_cx = None
         self._color_smooth_cy = None
         
-        # 外部系统 (Winch & Gripper)
-        self.external_system = ExternalSystemController()
+        # 外部系统 (Winch & Gripper — WebSocket)
+        self.winch_config: Dict[str, Any] = DEFAULT_WINCH_CONFIG.copy()
+        self.winch_controller: Optional["WinchController"] = None
+        self.gripper_controller: Optional["GripperController"] = None
+        self._init_winch_controllers()
         
         # LoRa GPS 接收器（接收另一组发来的目标坐标）
         self.lora_receiver = LoRaGPSReceiver()
@@ -373,6 +461,37 @@ class DroneControlSystem:
         self._drone_thread = threading.Thread(target=self._drone_worker, daemon=True)
         self._drone_thread.start()
         
+    def _init_winch_controllers(self):
+        """根据 self.winch_config 实例化（或重建）控制器:
+           Winch  → USB Serial (WinchSerialController)
+           Gripper → WebSocket (GripperController)
+        """
+        cfg = self.winch_config
+        # 断开旧连接
+        if self.winch_controller and self.winch_controller.connected:
+            try:
+                self.winch_controller.disconnect()
+            except Exception:
+                pass
+        if self.gripper_controller and self.gripper_controller.connected:
+            try:
+                self.gripper_controller.disconnect()
+            except Exception:
+                pass
+        # Winch: Serial
+        self.winch_controller = WinchSerialController(
+            port=cfg["winch_port"],
+            baud=int(cfg["winch_baud"]),
+        )
+        # Gripper: WebSocket
+        if _GRIPPER_OK:
+            self.gripper_controller = GripperController(
+                ws_url=cfg["gripper_url"],
+                recv_timeout=30.0,
+            )
+        else:
+            self.gripper_controller = None
+
     def set_flying(self, value: bool, source: str):
         """设置飞行状态 + 诊断日志（追踪所有状态变更来源）"""
         old = self.drone_status.flying
@@ -488,7 +607,10 @@ class DroneControlSystem:
         
         # 4. 取消 moveTo 之后再发 hover 命令
         self._send_hover()
-        
+
+        # 5. 停止绞盘（发 stop 命令到 WebSocket）
+        self._emergency_stop_winch()
+
         self.log("🛑 All systems stopped, drone hovering", "warning")
     
     def manual_control(self, axis: str, value: int):
@@ -1505,64 +1627,185 @@ class DroneControlSystem:
             elapsed += check_interval
         return True
     
+    # ── Winch 辅助 ──────────────────────────────────────────────────────────
+
+    def _emergency_stop_winch(self):
+        """Send stop to winch (Serial), reset state flags."""
+        if self.winch_controller:
+            try:
+                self.winch_controller.stop()
+            except Exception:
+                pass
+        self.winch_status.state = SystemState.IDLE.value
+        self.winch_status.current_action = "IDLE"
+        self.winch_status.message = "Emergency stopped"
+        self.log("🚨 Winch emergency stopped", "warning")
+
+    def _wait_for_winch_done(self, winch, timeout: float = 120.0, action: str = "") -> bool:
+        """
+        等待绞盘完成信号 (`ok: done`)，期间每秒检查一次 stop_flag。
+        返回 True = 收到完成信号；False = 被停止或超时。
+        """
+        elapsed = 0.0
+        poll = 1.0
+        while elapsed < timeout:
+            if self.stop_flag.is_set():
+                self.log("🚨 Emergency stop during winch wait", "warning")
+                self._emergency_stop_winch()
+                return False
+            resp = winch.recv_with_timeout(poll)
+            elapsed += poll
+            if resp is None:
+                continue
+            resp_stripped = resp.strip()
+            self.log(f"📡 Winch: {resp_stripped[:80]}", "info")
+            lower = resp_stripped.lower()
+            if "ok: done" in lower or "target reached" in lower:
+                self.log(f"✅ Winch {action} completed: {resp_stripped[:80]}", "success")
+                return True
+        self.log(f"❌ Winch {action} timeout after {timeout:.0f}s", "error")
+        self.winch_status.state = SystemState.ERROR.value
+        self.winch_status.message = f"{action} timeout"
+        return False
+
     def _trigger_winch(self):
-        """触发绞盘系统 - 使用真实 HTTP 命令（参考 fly_track_and_grab.py）"""
+        """
+        Full grab sequence:
+          Gripper RELEASE → ok
+          Winch lower:<mm>  [Serial] → ok → wait ok: done
+          Gripper GRIP  → ok
+          Winch pull:<mm>   [Serial] → ok → wait ok: done
+        """
+        if not self.winch_controller:
+            self.log("❌ Winch controller not initialized", "error")
+            self.winch_status.state = SystemState.ERROR.value
+            self.winch_status.message = "Winch controller not initialized"
+            return
+
         try:
             self.winch_status.state = SystemState.RUNNING.value
-            
-            # 步骤1: LOWER
+            cfg = self.winch_config
+            winch = self.winch_controller
+            gripper = self.gripper_controller if cfg.get("use_gripper") else None
+            lower_mm   = int(cfg.get("lower_length", 100))
+            pull_mm    = int(cfg.get("pull_length",  150))
+            lower_wait = float(cfg.get("lower_wait", 120.0))
+            pull_wait  = float(cfg.get("pull_wait",  120.0))
+
+            def received_ok(resp) -> bool:
+                return resp is not None and "ok" in (resp or "").lower()
+
+            # ── Connect Winch (Serial) ─────────────────────────────────────
+            if not winch.connected:
+                self.log(f"🔌 Winch Serial connecting: {winch.port} @ {winch.baud}", "info")
+                if not winch.connect():
+                    self.log(f"❌ Winch Serial connect failed: {winch.port}", "error")
+                    self.winch_status.state = SystemState.ERROR.value
+                    self.winch_status.message = "Winch Serial connect failed"
+                    return
+            self.winch_status.winch_ws_connected = True
+
+            if gripper and not gripper.connected:
+                self.log(f"🔌 Gripper connecting: {gripper.ws_url}", "info")
+                if not gripper.connect():
+                    self.log("⚠️ Gripper connect failed, running without gripper", "warning")
+                    gripper = None
+            if gripper:
+                self.winch_status.gripper_ws_connected = True
+
+            # ── 步骤1: Gripper RELEASE ────────────────────────────────────
+            if gripper:
+                if self.stop_flag.is_set():
+                    self._emergency_stop_winch()
+                    return
+                self.winch_status.current_action = "GRIPPER RELEASE"
+                self.winch_status.message = "Gripper releasing..."
+                self.log("📤 Gripper: release", "info")
+                resp = gripper.send_raw("release")
+                if received_ok(resp):
+                    self.log("✅ Gripper released", "success")
+                else:
+                    self.log(f"⚠️ Gripper release resp: {resp} — continuing", "warning")
+
+            # ── 步骤2: Winch LOWER ────────────────────────────────────────
+            if self.stop_flag.is_set():
+                self._emergency_stop_winch()
+                return
             self.winch_status.current_action = "LOWERING"
-            self.winch_status.message = "Lowering..."
-            self.log(f"⬇️ Sending LOWER to {self.external_system.base_url}", "info")
-            if not self.external_system.send_command("lower"):
-                self.log("⚠️ LOWER command failed, continuing...", "warning")
-            
-            if not self._interruptible_sleep(5):
-                self.external_system.send_command("stop")
-                self.winch_status.state = SystemState.IDLE.value
-                self.winch_status.message = "Emergency stopped"
-                self.log("🚨 Winch interrupted by emergency stop", "warning")
+            self.winch_status.message = f"Winch lower {lower_mm} mm..."
+            self.log(f"⬇️ Winch: lower:{lower_mm}", "info")
+            resp = winch.send_raw(f"lower:{lower_mm}")
+            if not received_ok(resp):
+                self.log(f"❌ Winch lower no ok: {resp}", "error")
+                self.winch_status.state = SystemState.ERROR.value
+                self.winch_status.message = "Lower failed"
                 return
-            
-            # 步骤2: PULL
+            self.log("✅ Winch lower started, waiting for ok: done...", "info")
+            self.winch_status.message = f"Lowering {lower_mm} mm… (waiting ok: done)"
+            if not self._wait_for_winch_done(winch, timeout=120.0, action="lower"):
+                return
+
+            # ── 步骤3: Gripper GRIP ───────────────────────────────────────
+            if gripper:
+                if self.stop_flag.is_set():
+                    self._emergency_stop_winch()
+                    return
+                self.winch_status.current_action = "GRIPPER GRIP"
+                self.winch_status.message = "Gripper gripping..."
+                self.log("🤏 Gripper: grip", "info")
+                resp = gripper.send_raw("grip")
+                if received_ok(resp):
+                    self.log("✅ Gripper gripped", "success")
+                else:
+                    self.log(f"⚠️ Gripper grip resp: {resp} — continuing", "warning")
+
+            # ── 步骤4: Winch PULL ─────────────────────────────────────────
+            if self.stop_flag.is_set():
+                self._emergency_stop_winch()
+                return
             self.winch_status.current_action = "PULLING"
-            self.winch_status.message = "Pulling..."
-            self.log(f"⬆️ Sending PULL to {self.external_system.base_url}", "info")
-            if not self.external_system.send_command("pull"):
-                self.log("⚠️ PULL command failed, continuing...", "warning")
-            
-            if not self._interruptible_sleep(3):
-                self.external_system.send_command("stop")
-                self.winch_status.state = SystemState.IDLE.value
-                self.winch_status.message = "Emergency stopped"
-                self.log("🚨 Winch interrupted by emergency stop", "warning")
+            self.winch_status.message = f"Winch pull {pull_mm} mm..."
+            self.log(f"⬆️ Winch: pull:{pull_mm}", "info")
+            resp = winch.send_raw(f"pull:{pull_mm}")
+            if not received_ok(resp):
+                self.log(f"❌ Winch pull no ok: {resp}", "error")
+                self.winch_status.state = SystemState.ERROR.value
+                self.winch_status.message = "Pull failed"
                 return
-            
-            # 步骤3: STOP
-            self.winch_status.current_action = "STOP"
-            self.winch_status.message = "Stopping..."
-            self.log(f"⏹️ Sending STOP to {self.external_system.base_url}", "info")
-            self.external_system.send_command("stop")
-            
+            self.log("✅ Winch pull started, waiting for ok: done...", "info")
+            self.winch_status.message = f"Pulling {pull_mm}mm… (waiting ok: done, up to {pull_wait:.0f}s)"
+            if not self._wait_for_winch_done(winch, timeout=pull_wait, action="pull"):
+                return
+
+            # ── 完成 ──────────────────────────────────────────────────────
             self.winch_status.state = SystemState.COMPLETED.value
-            self.winch_status.message = "Completed"
-            self.log("✅ Winch sequence completed", "success")
-            
+            self.winch_status.current_action = "COMPLETED"
+            self.winch_status.message = "Grab sequence completed ✓"
+            self.log("✅ Winch & Gripper grab sequence completed!", "success")
+
         except Exception as e:
             self.winch_status.state = SystemState.ERROR.value
             self.winch_status.message = f"Error: {str(e)}"
-            self.log(f"❌ Winch system error: {str(e)}", "error")
+            self.log(f"❌ Winch sequence error: {str(e)}", "error")
     
     def get_status(self) -> Dict[str, Any]:
         """获取系统完整状态"""
         p = asdict(self.perception_status)
         p["hsv"] = self.hsv_config.copy()
         p["has_mask"] = self.mask_frame is not None
+        w = asdict(self.winch_status)
+        w["config"] = self.winch_config.copy()
+        w["winch_ws_connected"] = (
+            self.winch_controller.connected if self.winch_controller else False
+        )
+        w["gripper_ws_connected"] = (
+            self.gripper_controller.connected if self.gripper_controller else False
+        )
         return {
             "drone": asdict(self.drone_status),
             "navigation": asdict(self.navigation_status),
             "perception": p,
-            "winch": asdict(self.winch_status),
+            "winch": w,
             "lora_gps": self.lora_receiver.get_status(),
             "logs": self.logs[-10:]  # 最近10条日志
         }
@@ -1884,51 +2127,221 @@ def api_mask_feed():
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+@app.route('/api/winch/config', methods=['POST'])
+def api_winch_config():
+    """更新 Winch(Serial) / Gripper(WebSocket) 配置并重建控制器"""
+    data = request.json or {}
+    cfg = control_system.winch_config
+    if "winch_port" in data:
+        cfg["winch_port"] = str(data["winch_port"]).strip()
+    if "winch_baud" in data:
+        try:
+            cfg["winch_baud"] = int(data["winch_baud"])
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "Invalid winch_baud"}), 400
+    if "gripper_url" in data:
+        cfg["gripper_url"] = str(data["gripper_url"]).strip()
+    for key in ("lower_length", "pull_length", "lower_wait", "pull_wait"):
+        if key in data:
+            try:
+                cfg[key] = float(data[key])
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": f"Invalid {key}"}), 400
+    if "use_gripper" in data:
+        cfg["use_gripper"] = bool(data["use_gripper"])
+    control_system._init_winch_controllers()
+    control_system.log(
+        f"⚙️ Winch config: serial={cfg['winch_port']}@{cfg['winch_baud']} "
+        f"gripper={cfg['gripper_url']} "
+        f"lower={cfg['lower_length']}mm pull={cfg['pull_length']}mm "
+        f"use_gripper={cfg['use_gripper']}",
+        "info",
+    )
+    return jsonify({"success": True, "config": cfg})
+
+
+@app.route('/api/gripper/command', methods=['POST'])
+def api_gripper_command():
+    """手动发送 Gripper 命令: hold | release | grip | status"""
+    data = request.json or {}
+    cmd = data.get("command", "").strip().lower()
+    valid = ("hold", "release", "grip", "status")
+    if cmd not in valid:
+        return jsonify({"success": False, "error": f"Unknown command: {cmd!r}, allowed: {valid}"}), 400
+    gripper = control_system.gripper_controller
+    if not gripper:
+        return jsonify({"success": False, "error": "Gripper not initialized"}), 503
+
+    def run():
+        if not gripper.connected:
+            control_system.log(f"🔌 Gripper auto-connect: {gripper.ws_url}", "info")
+            gripper.connect()
+        resp = gripper.send_raw(cmd)
+        if resp:
+            control_system.log(f"🤏 Gripper {cmd} → {resp.strip()[:60]}", "info")
+        else:
+            control_system.log(f"⚠️ Gripper {cmd}: no response", "warning")
+        control_system.winch_status.gripper_ws_connected = gripper.connected
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
 @app.route('/api/test/winch', methods=['POST'])
 def api_test_winch():
-    """测试 Winch System - 尝试发送实际 HTTP 命令"""
+    """测试 Winch WebSocket 连接 — 发送 stop 命令验证可达性"""
     def run_test():
         try:
-            url = control_system.external_system.base_url
-            control_system.log(f"🧪 Testing Winch System at {url}", "info")
-            
-            # 1. 测试 LOWER
-            control_system.log("⬇️ Sending LOWER...", "info")
-            ok = control_system.external_system.send_command("lower")
-            if ok:
-                control_system.log("✅ LOWER: OK", "success")
+            # ── Test Winch Serial (独立) ──────────────────────────────────
+            winch = control_system.winch_controller
+            if winch:
+                cfg = control_system.winch_config
+                control_system.log(
+                    f"🧪 Testing Winch Serial: {cfg['winch_port']} @ {cfg['winch_baud']}", "info"
+                )
+                if not winch.connected:
+                    winch.connect()
+                if winch.connected:
+                    winch.send_raw("stop", expect_response=False)
+                    control_system.log("✅ Winch Serial connected, sent stop", "success")
+                    control_system.winch_status.winch_ws_connected = True
+                else:
+                    control_system.log(
+                        f"❌ Winch Serial connect failed: {cfg['winch_port']}", "error"
+                    )
+                    control_system.winch_status.winch_ws_connected = False
             else:
-                control_system.log("❌ LOWER: FAILED (connection error?)", "error")
-                control_system.log(f"ℹ️ Check if winch system is at {url}", "info")
-                return
-            
-            time.sleep(2)
-            
-            # 2. 测试 PULL
-            control_system.log("⬆️ Sending PULL...", "info")
-            ok = control_system.external_system.send_command("pull")
-            if ok:
-                control_system.log("✅ PULL: OK", "success")
+                control_system.log("⚠️ Winch controller not initialized", "warning")
+
+            # ── Test Gripper WebSocket (独立，不受 Winch 结果影响) ─────────
+            gripper = control_system.gripper_controller
+            if gripper:
+                control_system.log(f"🧪 Testing Gripper WebSocket: {gripper.ws_url}", "info")
+                if not gripper.connected:
+                    gripper.connect()
+                if gripper.connected:
+                    resp = gripper.send_raw("status")
+                    control_system.log(
+                        f"✅ Gripper connected — status: {(resp or 'no response').strip()[:60]}",
+                        "success",
+                    )
+                    control_system.winch_status.gripper_ws_connected = True
+                else:
+                    control_system.log(f"❌ Gripper connect failed: {gripper.ws_url}", "error")
+                    control_system.winch_status.gripper_ws_connected = False
             else:
-                control_system.log("❌ PULL: FAILED", "error")
-            
-            time.sleep(2)
-            
-            # 3. 测试 STOP
-            control_system.log("⏹️ Sending STOP...", "info")
-            ok = control_system.external_system.send_command("stop")
-            if ok:
-                control_system.log("✅ STOP: OK", "success")
-            else:
-                control_system.log("❌ STOP: FAILED", "error")
-            
-            control_system.log("✅ Winch System test complete", "success")
-            
+                control_system.log("⚠️ Gripper controller not initialized", "warning")
+
+            control_system.log("🧪 Connection test finished", "info")
         except Exception as e:
-            control_system.log(f"❌ Winch test error: {str(e)}", "error")
-    
-    # 在后台线程运行（因为有 sleep）
+            control_system.log(f"❌ Test error: {str(e)}", "error")
+
     threading.Thread(target=run_test, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route('/api/winch/trigger', methods=['POST'])
+def api_winch_trigger():
+    """
+    手动触发完整抓取流程（无需 Drone / Perception）。
+    等同于自动触发，适合纯 WiFi 环境下独立测试 Winch & Gripper。
+    """
+    if control_system.winch_status.state == SystemState.RUNNING.value:
+        return jsonify({"success": False, "error": "Sequence already running"}), 409
+
+    # 清除 stop_flag 残留（前一次 emergency_stop 可能留下）
+    control_system.stop_flag.clear()
+
+    def run():
+        control_system.log("🚀 Manual winch trigger (standalone mode)", "info")
+        control_system._trigger_winch()
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route('/api/winch/command', methods=['POST'])
+def api_winch_command():
+    """Manual Winch Serial command: lower:<mm> | pull:<mm> | stop"""
+    data   = request.get_json(force=True, silent=True) or {}
+    cmd    = str(data.get("command", "")).strip().lower()
+    length = data.get("length", 0)
+    valid  = ("lower", "pull", "stop")
+    if cmd not in valid:
+        return jsonify({"success": False, "error": f"Unknown command: {cmd!r}"}), 400
+    winch = control_system.winch_controller
+    if not winch:
+        return jsonify({"success": False, "error": "Winch not initialized"}), 503
+
+    def run():
+        try:
+            if not winch.connected:
+                control_system.log(f"🔌 Winch auto-connect: {winch.port}", "info")
+                winch.connect()
+            if not winch.connected:
+                control_system.log(f"❌ Winch connect failed: {winch.port}", "error")
+                return
+            cmd_str = "stop" if cmd == "stop" else f"{cmd}:{int(length)}"
+            control_system.log(f"🔧 Winch manual → {cmd_str}", "info")
+            resp = winch.send_raw(cmd_str, expect_response=(cmd != "stop"))
+            if cmd != "stop":
+                if resp and "ok" in resp.lower():
+                    control_system.log(f"✅ Winch {cmd} accepted: {resp.strip()[:80]}", "success")
+                else:
+                    control_system.log(f"⚠️ Winch {cmd} response: {resp!r} (no ok)", "warning")
+            control_system.winch_status.winch_ws_connected = winch.connected
+        except Exception as exc:
+            control_system.log(f"❌ Winch command error: {exc}", "error")
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route('/api/winch/reset', methods=['POST'])
+def api_winch_reset():
+    """Reset: Winch pull to pull_length mm + Gripper hold"""
+    def run():
+        try:
+            winch   = control_system.winch_controller
+            gripper = control_system.gripper_controller
+            pull_mm = int(control_system.winch_config.get("pull_length", 150))
+            control_system.log(f"🔄 Reset — Winch pull:{pull_mm}mm + Gripper hold", "info")
+
+            if winch:
+                if not winch.connected:
+                    winch.connect()
+                if winch.connected:
+                    resp = winch.send_raw(f"pull:{pull_mm}")
+                    if resp and "ok" in resp.lower():
+                        control_system.log(f"✅ Winch reset pull:{pull_mm}mm accepted", "success")
+                    else:
+                        control_system.log(f"⚠️ Winch reset response: {resp!r}", "warning")
+                    control_system.winch_status.winch_ws_connected = winch.connected
+                else:
+                    control_system.log(f"❌ Winch reset: connect failed ({winch.port})", "error")
+            else:
+                control_system.log("⚠️ Winch not initialized — skip winch reset", "warning")
+
+            if gripper:
+                if not gripper.connected:
+                    gripper.connect()
+                if gripper.connected:
+                    resp = gripper.send_raw("hold")
+                    if resp and "ok" in resp.lower():
+                        control_system.log("✅ Gripper hold (reset)", "success")
+                    else:
+                        control_system.log(f"⚠️ Gripper hold response: {resp!r}", "warning")
+                    control_system.winch_status.gripper_ws_connected = gripper.connected
+                else:
+                    control_system.log(f"❌ Gripper reset: connect failed ({gripper.ws_url})", "error")
+            else:
+                control_system.log("⚠️ Gripper not initialized — skip gripper reset", "warning")
+
+            control_system.log("🔄 Reset complete", "info")
+        except Exception as exc:
+            control_system.log(f"❌ Reset error: {exc}", "error")
+
+    threading.Thread(target=run, daemon=True).start()
     return jsonify({"success": True})
 
 
@@ -1958,6 +2371,13 @@ def api_lora_disconnect():
 def api_lora_status():
     """获取 LoRa GPS 当前状态"""
     return jsonify(control_system.lora_receiver.get_status())
+
+
+@app.route('/api/logs/clear', methods=['POST'])
+def api_logs_clear():
+    """Clear server-side log buffer"""
+    control_system.logs.clear()
+    return jsonify({"success": True})
 
 
 def main():

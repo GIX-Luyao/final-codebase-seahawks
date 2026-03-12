@@ -857,21 +857,208 @@ body::after {
     letter-spacing: 1px;
 }
 
-.winch-idle .status-text {
-    color: #94a3b8;
+.winch-idle .status-text      { color: #94a3b8; }
+.winch-triggered .status-text { color: var(--warning-solid); animation: pulse-anim 1s infinite; }
+.winch-gripper .status-text   { color: #a78bfa; }
+.winch-lowering .status-text  { color: var(--warning-solid); }
+.winch-waiting .status-text   { color: #fb923c; }
+.winch-pulling .status-text   { color: var(--primary-solid); }
+.winch-completed .status-text { color: var(--success-solid); }
+.winch-error .status-text     { color: var(--danger-solid); }
+
+/* ── WebSocket connection badges ── */
+.winch-conn-row {
+    display: flex;
+    gap: 0.5rem;
+    margin: 0.6rem 0 0.8rem;
+    flex-wrap: wrap;
+}
+.conn-badge {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    letter-spacing: 0.3px;
+}
+.conn-ok  { background: rgba(16,185,129,.12); color: #059669; border: 1px solid rgba(16,185,129,.35); }
+.conn-off { background: rgba(100,116,139,.08); color: #64748b; border: 1px solid rgba(100,116,139,.25); }
+
+/* ── Grab sequence flow ── */
+.winch-sequence-box {
+    background: rgba(8,145,178,.07);
+    border: 1px solid rgba(8,145,178,.2);
+    border-radius: 12px;
+    padding: 0.9rem 1rem;
+    margin: 0.8rem 0;
+}
+.seq-title {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 0.5rem;
+}
+.seq-flow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.78rem;
+}
+.seq-step {
+    background: rgba(255,255,255,.7);
+    border: 1px solid rgba(0,0,0,.1);
+    padding: 0.2rem 0.55rem;
+    border-radius: 6px;
+    color: #334155;
+    font-weight: 500;
+    transition: all .2s;
+}
+.seq-step.seq-active {
+    background: rgba(8,145,178,.15);
+    border-color: rgba(8,145,178,.5);
+    color: #0369a1;
+    font-weight: 700;
+    box-shadow: 0 0 6px rgba(8,145,178,.2);
+}
+.seq-arrow { color: #64748b; font-size: 0.72rem; }
+
+/* ── Winch connection type labels ── */
+.winch-conn-type-row {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.9rem;
+}
+.conn-type-badge {
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.65rem;
+    border-radius: 999px;
+}
+.serial-badge { background: rgba(245,158,11,.12); color: #b45309; border: 1px solid rgba(245,158,11,.3); }
+.ws-badge     { background: rgba(102,126,234,.1);  color: #4338ca; border: 1px solid rgba(102,126,234,.25); }
+
+/* ── Winch config panel ── */
+.winch-config-panel {
+    background: rgba(255,255,255,.6);
+    border: 1px solid rgba(0,0,0,.08);
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin: 0.8rem 0;
+}
+.winch-config-header {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 0.8rem;
+}
+.form-row-sm {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.55rem;
+}
+.form-row-sm label {
+    font-size: 0.78rem;
+    color: #475569;
+    min-width: 90px;
+    flex-shrink: 0;
+    font-weight: 500;
+}
+.form-row-lengths {
+    display: flex;
+    gap: 0.6rem;
+    margin-bottom: 0.55rem;
+}
+.form-row-sm.half { flex: 1; }
+.input-sm {
+    flex: 1;
+    background: rgba(255,255,255,.85);
+    border: 1px solid rgba(0,0,0,.15);
+    border-radius: 8px;
+    padding: 0.3rem 0.6rem;
+    color: #1e293b;
+    font-size: 0.82rem;
+    outline: none;
+    width: 100%;
+}
+.input-sm::placeholder { color: #94a3b8; }
+.input-sm:focus { border-color: #0891b2; background: #fff; box-shadow: 0 0 0 2px rgba(8,145,178,.15); }
+.form-row-toggle { margin: 0.4rem 0 0.8rem; }
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: #334155;
+    cursor: pointer;
+    font-weight: 500;
+}
+.winch-cfg-btns {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
 }
 
-.winch-lowering .status-text {
-    color: var(--warning-solid);
+/* ── Manual Winch panel ── */
+.winch-manual-panel {
+    background: rgba(245,158,11,.06);
+    border: 1px solid rgba(245,158,11,.2);
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin: 0.6rem 0;
+}
+.manual-winch-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.manual-len-input {
+    width: 75px !important;
+    flex: none !important;
+    text-align: center;
 }
 
-.winch-pulling .status-text {
-    color: var(--primary-solid);
+/* ── Manual Gripper panel ── */
+.gripper-manual-panel {
+    background: rgba(124,58,237,.06);
+    border: 1px solid rgba(124,58,237,.18);
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin: 0.6rem 0;
 }
+.gripper-btn-row {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+.btn-outline {
+    background: transparent;
+    border: 1px solid rgba(0,0,0,.18);
+    color: #334155;
+}
+.btn-outline:hover { background: rgba(0,0,0,.04); }
 
-.winch-completed .status-text {
-    color: var(--success-solid);
+/* ── Standalone test panel ── */
+.winch-standalone-panel {
+    background: rgba(239,68,68,.05);
+    border: 1px solid rgba(239,68,68,.2);
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin: 0.6rem 0;
 }
+.standalone-hint {
+    font-size: 0.78rem;
+    color: #475569;
+    margin: 0 0 0.8rem;
+    line-height: 1.5;
+}
+.standalone-btns { display: flex; flex-direction: column; gap: 0.3rem; }
 
 .status-message {
     margin-top: 1rem;

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Seahawks - Drone Control</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=16">
+    <link rel="stylesheet" href="/static/css/style.css?v=22">
     <!-- Vue.js served locally (no CDN dependency) -->
     <script src="/static/js/vue.global.js"></script>
     <style>
@@ -523,11 +523,12 @@
 
                     <!-- Winch System Tab -->
                     <div v-show="activeTab === 'winch'" class="tab-pane">
-                        <h3>Winch & Gripper System</h3>
+                        <h3>Winch &amp; Gripper System</h3>
                         <span class="status-badge" :class="getStatusClass(winch.state)">
                             {{ getStatusText(winch.state) }}
                         </span>
-                        
+
+                        <!-- Runtime state -->
                         <div class="winch-status">
                             <div class="status-indicator" :class="getWinchActionClass(winch.current_action)">
                                 <div class="status-icon">{{ getWinchIcon(winch.current_action) }}</div>
@@ -535,16 +536,156 @@
                             </div>
                             <p class="status-message">{{ winch.message }}</p>
                         </div>
-                        
-                        <div class="info-box">
-                            <p>The winch system will be triggered automatically when the target is stable.</p>
-                            <p>Sequence: LOWER → PULL → STOP</p>
+
+                        <!-- Connection status badges -->
+                        <div class="winch-conn-row">
+                            <span class="conn-badge" :class="winch.winch_ws_connected ? 'conn-ok' : 'conn-off'">
+                                {{ winch.winch_ws_connected ? '● Winch Serial' : '○ Winch Serial' }}
+                            </span>
+                            <span class="conn-badge" :class="winch.gripper_ws_connected ? 'conn-ok' : 'conn-off'"
+                                  v-if="winchCfg.use_gripper">
+                                {{ winch.gripper_ws_connected ? '● Gripper WS' : '○ Gripper WS' }}
+                            </span>
                         </div>
-                        
-                        <button class="btn btn-info btn-block" @click="testWinch"
-                                style="margin-top: 1rem;">
-                            Test Winch System
-                        </button>
+
+                        <!-- Grab sequence flow -->
+                        <div class="winch-sequence-box">
+                            <div class="seq-title">Grab Sequence</div>
+                            <div class="seq-flow">
+                                <template v-if="winchCfg.use_gripper">
+                                    <span class="seq-step" :class="winch.current_action==='GRIPPER RELEASE' ? 'seq-active':''">Gripper RELEASE</span>
+                                    <span class="seq-arrow">→</span>
+                                </template>
+                                <span class="seq-step" :class="winch.current_action==='LOWERING' ? 'seq-active':''">
+                                    LOWER {{ winchCfg.lower_length }}mm
+                                </span>
+                                <span class="seq-arrow">→ ok:done →</span>
+                                <template v-if="winchCfg.use_gripper">
+                                    <span class="seq-step" :class="winch.current_action==='GRIPPER GRIP' ? 'seq-active':''">Gripper GRIP</span>
+                                    <span class="seq-arrow">→</span>
+                                </template>
+                                <span class="seq-step" :class="winch.current_action==='PULLING' ? 'seq-active':''">
+                                    PULL {{ winchCfg.pull_length }}mm
+                                </span>
+                                <span class="seq-arrow">→ ok:done</span>
+                            </div>
+                        </div>
+
+                        <!-- Configuration -->
+                        <div class="winch-config-panel">
+                            <div class="winch-config-header">⚙️ Configuration</div>
+
+                            <div class="winch-conn-type-row">
+                                <span class="conn-type-badge serial-badge">🔌 Winch: USB Serial</span>
+                                <span class="conn-type-badge ws-badge">📡 Gripper: WebSocket</span>
+                            </div>
+
+                            <div class="form-row-sm">
+                                <label>Serial Port</label>
+                                <input type="text" v-model="winchCfg.winch_port"
+                                       placeholder="/dev/ttyUSB0" class="input-sm">
+                            </div>
+                            <div class="form-row-sm">
+                                <label>Baud Rate</label>
+                                <input type="number" v-model.number="winchCfg.winch_baud"
+                                       placeholder="115200" class="input-sm">
+                            </div>
+                            <div class="form-row-sm">
+                                <label>Gripper URL</label>
+                                <input type="text" v-model="winchCfg.gripper_url"
+                                       placeholder="ws://192.168.42.15:81" class="input-sm">
+                            </div>
+                            <div class="form-row-lengths">
+                                <div class="form-row-sm half">
+                                    <label>Lower (mm)</label>
+                                    <input type="number" v-model.number="winchCfg.lower_length"
+                                           min="1" max="2000" class="input-sm">
+                                </div>
+                                <div class="form-row-sm half">
+                                    <label>Pull (mm)</label>
+                                    <input type="number" v-model.number="winchCfg.pull_length"
+                                           min="1" max="2000" class="input-sm">
+                                </div>
+                            </div>
+                            <div class="form-row-lengths">
+                                <div class="form-row-sm half">
+                                    <label>Lower Wait (s)</label>
+                                    <input type="number" v-model.number="winchCfg.lower_wait"
+                                           min="1" max="120" step="1" class="input-sm">
+                                </div>
+                                <div class="form-row-sm half">
+                                    <label>Pull Wait (s)</label>
+                                    <input type="number" v-model.number="winchCfg.pull_wait"
+                                           min="1" max="120" step="1" class="input-sm">
+                                </div>
+                            </div>
+                            <div class="form-row-toggle">
+                                <label class="toggle-label">
+                                    <input type="checkbox" v-model="winchCfg.use_gripper">
+                                    Enable Gripper in grab sequence
+                                </label>
+                            </div>
+                            <div class="winch-cfg-btns">
+                                <button class="btn btn-primary btn-sm" @click="applyWinchConfig"
+                                        :disabled="winchBusy">
+                                    {{ winchBusy ? 'Applying...' : '✓ Apply Config' }}
+                                </button>
+                                <button class="btn btn-info btn-sm" @click="testWinch"
+                                        :disabled="winchBusy">
+                                    🔌 Test Connection
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Manual Winch Control -->
+                        <div class="winch-manual-panel">
+                            <div class="winch-config-header">🔧 Manual Winch Control (Serial)</div>
+                            <div class="manual-winch-row">
+                                <input type="number" v-model.number="winchManualLen"
+                                       min="1" max="2000" class="input-sm manual-len-input"
+                                       placeholder="mm">
+                                <button class="btn btn-warning btn-sm" @click="winchCmd('lower')">⬇ Lower</button>
+                                <button class="btn btn-primary btn-sm" @click="winchCmd('pull')">⬆ Pull</button>
+                                <button class="btn btn-danger btn-sm"  @click="winchCmd('stop')">⏹ Stop</button>
+                            </div>
+                        </div>
+
+                        <!-- Manual Gripper Control -->
+                        <div class="gripper-manual-panel" v-if="winchCfg.use_gripper">
+                            <div class="winch-config-header">🤏 Manual Gripper Control</div>
+                            <div class="gripper-btn-row">
+                                <button class="btn btn-secondary btn-sm" @click="gripperCmd('hold')">Hold</button>
+                                <button class="btn btn-warning btn-sm"   @click="gripperCmd('release')">Release</button>
+                                <button class="btn btn-success btn-sm"   @click="gripperCmd('grip')">Grip</button>
+                                <button class="btn btn-outline btn-sm"   @click="gripperCmd('status')">Status</button>
+                            </div>
+                        </div>
+
+                        <!-- Standalone Test (no drone required) -->
+                        <div class="winch-standalone-panel">
+                            <div class="winch-config-header">🧪 Standalone Test (No Drone Required)</div>
+                            <p class="standalone-hint">
+                                Connect all devices and run the full grab sequence or reset without the drone.
+                            </p>
+                            <div class="standalone-btns">
+                                <button class="btn btn-danger btn-block"
+                                        @click="triggerWinchManual"
+                                        :disabled="winch.state === 'running'">
+                                    {{ winch.state === 'running' ? '⏳ Running...' : '▶ Run Full Grab Sequence' }}
+                                </button>
+                                <button class="btn btn-success btn-block"
+                                        @click="resetSystems"
+                                        :disabled="winch.state === 'running'"
+                                        style="margin-top:0.4rem">
+                                    🔄 Reset (Winch pull + Gripper hold)
+                                </button>
+                                <button class="btn btn-secondary btn-sm"
+                                        @click="emergencyStop"
+                                        style="margin-top:0.4rem; width:100%">
+                                    🚨 Emergency Stop
+                                </button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -610,6 +751,6 @@
     </div>
     {% endraw %}
 
-    <script src="/static/js/app.js?v=16"></script>
+    <script src="/static/js/app.js?v=22"></script>
 </body>
 </html>

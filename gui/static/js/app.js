@@ -34,7 +34,7 @@ createApp({
             navConfig: {
                 target_lat: 47.6217966,
                 target_lon: -122.1784220,
-                target_alt: 2.0,
+                target_alt: 1.0,
                 arrival_threshold: 0.5
             },
             
@@ -71,13 +71,25 @@ createApp({
             // HSV update debounce timer
             hsvTimer: null,
             
-            // Winch status
+            // Winch / Gripper status
             winch: {
                 state: 'idle',
                 current_action: 'IDLE',
                 message: 'Ready',
-                progress: 0
+                progress: 0,
+                winch_ws_connected: false,
+                gripper_ws_connected: false,
+                config: {}
             },
+            // Winch editable config — populated from backend on mount, not hardcoded
+            winchCfg: {
+                winch_url:    '',
+                gripper_url:  '',
+                lower_length: null,
+                pull_length:  null,
+                use_gripper:  true,
+            },
+            winchBusy: false,
             
             // Logs
             logs: [],
@@ -119,6 +131,7 @@ createApp({
         this.startPolling();
         this.loadSavedLocations();
         this.loadHSV();
+        this.loadWinchConfig();
         this.addLog('GUI loaded, polling started', 'info');
     },
     
@@ -204,6 +217,10 @@ createApp({
             }
             if (data.winch) {
                 this.winch = { ...this.winch, ...data.winch };
+                // 同步可编辑配置（仅在用户没有在编辑时）
+                if (data.winch.config && !this.winchBusy) {
+                    this.winchCfg = { ...this.winchCfg, ...data.winch.config };
+                }
             }
             if (data.lora_gps) {
                 this.loraGps = { ...this.loraGps, ...data.lora_gps };
@@ -244,9 +261,10 @@ createApp({
             });
         },
         
-        // Clear logs
-        clearLogs() {
+        // Clear logs (frontend + backend buffer)
+        async clearLogs() {
             this.logs = [];
+            await this.apiCall('/api/logs/clear', 'POST');
         },
         
         // ========== API Calls ==========
@@ -500,6 +518,20 @@ createApp({
                 // use defaults
             }
         },
+
+        async loadWinchConfig() {
+            try {
+                const response = await fetch('/api/status');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.winch && data.winch.config) {
+                        this.winchCfg = { ...this.winchCfg, ...data.winch.config };
+                    }
+                }
+            } catch (e) {
+                // keep nulls; will be filled by first status poll
+            }
+        },
         
         setHSV(key, value) {
             this.hsv[key] = parseInt(value) || 0;
@@ -548,14 +580,69 @@ createApp({
         },
         
         async testWinch() {
-            if (confirm('Test Winch System? (LOWER → PULL → STOP)')) {
-                this.addLog('Testing Winch System...', 'info');
-                const result = await this.apiCall('/api/test/winch');
-                if (result.success) {
-                    this.addLog('Winch System test completed', 'success');
+            this.addLog('Testing Winch/Gripper WebSocket connection...', 'info');
+            const result = await this.apiCall('/api/test/winch');
+            if (result && result.success) {
+                this.addLog('Connection test started (see logs)', 'success');
+            } else {
+                this.addLog('Connection test failed', 'error');
+            }
+        },
+
+        async applyWinchConfig() {
+            this.winchBusy = true;
+            try {
+                const result = await this.apiCall('/api/winch/config', 'POST', { ...this.winchCfg });
+                if (result && result.success) {
+                    this.addLog(`Winch config applied: ${this.winchCfg.winch_port}@${this.winchCfg.winch_baud} lower=${this.winchCfg.lower_length}mm pull=${this.winchCfg.pull_length}mm`, 'success');
                 } else {
-                    this.addLog('Winch System test failed', 'error');
+                    this.addLog('Winch config update failed', 'error');
                 }
+            } finally {
+                this.winchBusy = false;
+            }
+        },
+
+        async gripperCmd(cmd) {
+            this.addLog(`Gripper manual: ${cmd}`, 'info');
+            const result = await this.apiCall('/api/gripper/command', 'POST', { command: cmd });
+            if (!result || !result.success) {
+                this.addLog(`Gripper ${cmd} failed`, 'error');
+            }
+        },
+
+        async winchCmd(cmd) {
+            const len = this.winchManualLen || 100;
+            this.addLog(`Winch manual: ${cmd}${cmd !== 'stop' ? ':' + len + 'mm' : ''}`, 'info');
+            const result = await this.apiCall('/api/winch/command', 'POST', { command: cmd, length: len });
+            if (!result || !result.success) {
+                this.addLog(`Winch ${cmd} failed: ${result?.error || ''}`, 'error');
+            }
+        },
+
+        async resetSystems() {
+            if (!confirm('Reset systems?\n• Winch: pull ' + (this.winchCfg.pull_length || 150) + 'mm\n• Gripper: hold')) return;
+            this.addLog('🔄 Reset: sending commands...', 'info');
+            const result = await this.apiCall('/api/winch/reset', 'POST', {});
+            if (result && result.success) {
+                this.addLog('Reset commands sent (check logs for response)', 'success');
+            } else {
+                this.addLog('Reset failed', 'error');
+            }
+        },
+
+        async triggerWinchManual() {
+            if (this.winch.state === 'running') {
+                this.addLog('Sequence already running', 'warning');
+                return;
+            }
+            if (!confirm('手动执行完整抓取流程？\n（Gripper Release → Winch Lower → Gripper Grip → Winch Pull）')) return;
+            this.addLog('▶ Manual winch trigger: starting full grab sequence...', 'info');
+            const result = await this.apiCall('/api/winch/trigger', 'POST', {});
+            if (result && result.success) {
+                this.addLog('Grab sequence started (watch logs for progress)', 'success');
+            } else {
+                this.addLog(`Trigger failed: ${result?.error || 'unknown error'}`, 'error');
             }
         },
         
@@ -580,22 +667,30 @@ createApp({
         
         getWinchActionClass(action) {
             const actionMap = {
-                'IDLE': 'winch-idle',
-                'LOWERING': 'winch-lowering',
-                'PULLING': 'winch-pulling',
-                'STOP': 'winch-completed',
-                'COMPLETED': 'winch-completed'
+                'IDLE':            'winch-idle',
+                'TRIGGERED':       'winch-triggered',
+                'GRIPPER RELEASE': 'winch-gripper',
+                'LOWERING':        'winch-lowering',
+                'WAITING':         'winch-waiting',
+                'GRIPPER GRIP':    'winch-gripper',
+                'PULLING':         'winch-pulling',
+                'COMPLETED':       'winch-completed',
+                'ERROR':           'winch-error',
             };
             return actionMap[action] || 'winch-idle';
         },
-        
+
         getWinchIcon(action) {
             const iconMap = {
-                'IDLE': '⏸️',
-                'LOWERING': '⬇️',
-                'PULLING': '⬆️',
-                'STOP': '⏹️',
-                'COMPLETED': '✅'
+                'IDLE':            '⏸️',
+                'TRIGGERED':       '🎯',
+                'GRIPPER RELEASE': '🔓',
+                'LOWERING':        '⬇️',
+                'WAITING':         '⏳',
+                'GRIPPER GRIP':    '🤏',
+                'PULLING':         '⬆️',
+                'COMPLETED':       '✅',
+                'ERROR':           '❌',
             };
             return iconMap[action] || '⏸️';
         },
