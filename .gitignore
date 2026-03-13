@@ -33,7 +33,7 @@ test_external_flow.py
 # ============================================
 # ESP32 firmware (hardware-specific, not run directly)
 # ============================================
-esp/
+# esp/
 
 # ============================================
 # Duplicate / loose assets at gui/ root
